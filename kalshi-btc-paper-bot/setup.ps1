@@ -80,6 +80,9 @@ if ($LASTEXITCODE -ne 0) { Fail "pip upgrade failed" }
 Write-Step "Installing pinned Python dependencies (requirements.txt + requirements-dev.txt)"
 & $VenvPy -m pip install --quiet -r (Join-Path $Backend "requirements.txt") -r (Join-Path $Backend "requirements-dev.txt")
 if ($LASTEXITCODE -ne 0) { Fail "pip install failed" }
+# Record which requirements are installed; start.ps1 re-installs automatically when this changes.
+$reqHash = (Get-FileHash -Algorithm SHA256 (Join-Path $Backend "requirements.txt")).Hash
+Set-Content -Path (Join-Path $Venv "requirements.sha256") -Value $reqHash -Encoding ascii
 
 if (-not $SkipFrontend) {
     Write-Step "Installing dashboard dependencies (npm ci, from package-lock.json)"

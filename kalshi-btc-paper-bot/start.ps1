@@ -45,8 +45,9 @@ if ($Port -le 0) {
     $Port = 8000
     $EnvFile = Join-Path $Root ".env"
     if (Test-Path $EnvFile) {
-        $line = Get-Content $EnvFile | Where-Object { $_ -match '^\s*KBOT_PORT\s*=\s*(\d+)' } | Select-Object -First 1
-        if ($line -and ($line -match '(\d+)\s*$')) { $Port = [int]$Matches[1] }
+        foreach ($line in (Get-Content $EnvFile)) {
+            if ($line -match '^\s*KBOT_PORT\s*=\s*["'']?(\d+)["'']?\s*$') { $Port = [int]$Matches[1]; break }
+        }
     }
 }
 $Url = "http://127.0.0.1:$Port"
@@ -54,6 +55,20 @@ $Url = "http://127.0.0.1:$Port"
 if (-not (Test-Path $VenvPy)) {
     Write-Host "Python environment not found. Run .\setup.ps1 first." -ForegroundColor Red
     exit 1
+}
+
+# Keep Python dependencies in sync with requirements.txt (e.g. after `git pull`), so new
+# dependencies such as truststore are installed without re-running setup.ps1 by hand.
+$ReqFile = Join-Path $Backend "requirements.txt"
+$Stamp = Join-Path $Backend ".venv\requirements.sha256"
+$reqHash = (Get-FileHash -Algorithm SHA256 $ReqFile).Hash
+$oldHash = ""
+if (Test-Path $Stamp) { $oldHash = (Get-Content $Stamp -Raw).Trim() }
+if ($reqHash -ne $oldHash) {
+    Write-Host "Python dependencies changed - installing (one time)..." -ForegroundColor Cyan
+    & $VenvPy -m pip install --quiet -r $ReqFile
+    if ($LASTEXITCODE -ne 0) { Write-Host "pip install failed. Run .\setup.ps1" -ForegroundColor Red; exit 1 }
+    Set-Content -Path $Stamp -Value $reqHash -Encoding ascii
 }
 
 if ($LiveCheck) {

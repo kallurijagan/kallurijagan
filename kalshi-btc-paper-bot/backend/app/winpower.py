@@ -40,9 +40,11 @@ def keep_awake(enabled: bool) -> None:
 
 
 def disable_quick_edit() -> None:
+    """Turn QuickEdit off for this run; the original console mode is restored at exit."""
     if os.name != "nt":
         return
     try:
+        import atexit
         import ctypes
 
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
@@ -50,7 +52,9 @@ def disable_quick_edit() -> None:
         mode = ctypes.c_uint32()
         if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             return  # stdin is not a console (redirected) - nothing to do
-        new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
-        kernel32.SetConsoleMode(handle, new_mode)
+        original = mode.value
+        kernel32.SetConsoleMode(handle, (original & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS)
+        # ENABLE_EXTENDED_FLAGS is required for SetConsoleMode to apply the QuickEdit bit.
+        atexit.register(lambda: kernel32.SetConsoleMode(handle, original | ENABLE_EXTENDED_FLAGS))
     except Exception as exc:  # noqa: BLE001
         log.warning("could not disable console QuickEdit mode: %s", exc)

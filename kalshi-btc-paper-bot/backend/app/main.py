@@ -65,7 +65,7 @@ def build_source(cfg: Config, clock: Clock):
     client = KalshiReadOnlyClient(cfg.kalshi_base_url, cfg.kalshi_fallback_base_url, cfg.http_timeout_seconds,
                                   now=clock.now)
     if isinstance(clock, SkewCorrectedClock):
-        clock.attach(lambda: client.clock_offset_seconds)
+        clock.attach(lambda: client.clock_offset_seconds, client.reset_clock_samples)
     return client
 
 

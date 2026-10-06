@@ -58,7 +58,11 @@ class Engine:
         self.entry_status: dict = {"state": "starting", "message": "Engine starting"}
         self.focus_ticker: str | None = None
         self._entry_block: str | None = None
-        self._due: dict[str, datetime] = {}
+        self._due: dict[str, float] = {}  # monotonic deadlines (immune to clock steps/offset changes)
+        self._last_poll_mono: dict[tuple[str, str], float] = {}
+        self._last_tick_mono: float | None = None
+        self.tick_started_mono: float | None = None
+        self.last_tick_done_mono: float | None = None
         self._settle_due: dict[str, datetime] = {}
         self._processed_book_at: dict[str, datetime] = {}
         self._last_tick_rec: dict[tuple[str, str], tuple[tuple, datetime]] = {}
@@ -74,7 +78,7 @@ class Engine:
                 deadline = time.monotonic() + self.cfg.lease_ttl_seconds + 2
                 while True:
                     try:
-                        acquire_lease(self.conn, self.owner, self.clock.now(), self.cfg.lease_ttl_seconds)
+                        acquire_lease(self.conn, self.owner, self.clock.raw_now(), self.cfg.lease_ttl_seconds)
                         break
                     except EngineAlreadyRunning:
                         if time.monotonic() > deadline:
@@ -135,52 +139,69 @@ class Engine:
             except asyncio.TimeoutError:
                 pass
 
-    def _retry_soon(self, key: str, now: datetime, seconds: float = 5.0) -> None:
-        self._due[key] = now + timedelta(seconds=seconds)
+    def _retry_soon(self, key: str, seconds: float = 5.0) -> None:
+        self._due[key] = self.clock.monotonic() + seconds
 
     def _detect_gap(self, now: datetime) -> None:
-        """Record when the engine was not running (PC asleep, console frozen, overloaded)."""
-        prev = self.last_tick_at
+        """Record when the engine was not running (PC asleep, console frozen, overloaded).
+
+        Measured on the monotonic clock, so clock-offset corrections and time syncs are not gaps.
+        """
+        mono = self.clock.monotonic()
+        prev = self._last_tick_mono
+        self._last_tick_mono = mono
         if prev is None:
             return
-        gap = (now - prev).total_seconds()
+        gap = mono - prev
         if gap <= max(15.0, 5 * self.cfg.tick_seconds):
             return
         tz = ZoneInfo(load_settings(self.conn).display_timezone)
-        msg = (f"engine was not running from {prev.astimezone(tz):%H:%M:%S} to {now.astimezone(tz):%H:%M:%S %Z} "
+        start = now - timedelta(seconds=gap)
+        msg = (f"Engine was not running from {start.astimezone(tz):%H:%M:%S} to {now.astimezone(tz):%H:%M:%S %Z} "
                f"({gap:.0f}s) — computer asleep, console window frozen by a click/selection, or system overloaded")
-        self.last_gap = {"from": iso(prev), "to": iso(now), "seconds": round(gap, 1), "message": msg}
+        self.last_gap = {"from": iso(start), "to": iso(now), "seconds": round(gap, 1), "message": msg}
         self._entry_block = msg
-        self.paper.log_event("warn", "engine", msg.capitalize())
+        self.paper.log_event("warn", "engine", msg)
 
-    def _due_now(self, key: str, interval: float, now: datetime) -> bool:
+    def _due_now(self, key: str, interval: float, now: datetime | None = None) -> bool:
+        mono = self.clock.monotonic()
         nxt = self._due.get(key)
-        if nxt is None or now >= nxt:
-            self._due[key] = now + timedelta(seconds=interval)
+        if nxt is None or mono >= nxt:
+            self._due[key] = mono + interval
             return True
         return False
+
+    def _poll_due(self, ticker: str, kind: str, interval: float) -> bool:
+        last = self._last_poll_mono.get((ticker, kind))
+        return last is None or self.clock.monotonic() - last >= interval
+
+    def _mark_polled(self, ticker: str, kind: str) -> None:
+        self._last_poll_mono[(ticker, kind)] = self.clock.monotonic()
+        if len(self._last_poll_mono) > 48:
+            self._last_poll_mono.pop(next(iter(self._last_poll_mono)))
 
     # ------------------------------------------------------------------ tick
     async def tick(self) -> None:
         now = self.clock.now()
         self.ticks += 1
+        self.tick_started_mono = self.clock.monotonic()
         self._detect_gap(now)
         self.last_tick_at = now
         trading = bool(self.paper.engine_state()["trading_enabled"])
         if self.use_locks:
             keep_awake(trading)
         if self.use_locks and self._due_now("lease", 5, now):
-            heartbeat(self.conn, self.owner, now)
+            heartbeat(self.conn, self.owner, self.clock.raw_now())
         if self._due_now("exchange", self.cfg.exchange_status_poll_seconds, now):
             if await self.md.refresh_exchange() is None:
-                self._retry_soon("exchange", now)  # a skipped/failed refresh must not wait a full interval
+                self._retry_soon("exchange")  # a skipped/failed refresh must not wait a full interval
         if self.md.series is None:
             if self._due_now("series_retry", 15, now):
                 if await self.md.refresh_series() is None:
-                    self._retry_soon("series_retry", now)
+                    self._retry_soon("series_retry")
         elif self._due_now("series", self.cfg.fee_schedule_refresh_seconds, now):
             if await self.md.refresh_series() is None:
-                self._retry_soon("series", now)
+                self._retry_soon("series")
 
         settings = load_settings(self.conn)
         ws = window_start_for(now)
@@ -213,6 +234,7 @@ class Engine:
             self._prune(now)
         if (we - now).total_seconds() <= self.cfg.discovery_lead_seconds:
             await self.md.discover(we, we + WINDOW)
+        self.last_tick_done_mono = self.clock.monotonic()
 
     # ------------------------------------------------------------------ entry
     async def _entry(self, now: datetime, ws: datetime, we: datetime, settings: StrategySettings,
@@ -346,14 +368,20 @@ class Engine:
             self._record_summary_tick(st.summary)
             self._record_book_tick(st.book, st.book_valid)
         else:
-            if st.last_summary_poll is None or (now - st.last_summary_poll).total_seconds() >= self.cfg.market_poll_seconds:
+            if self._poll_due(ticker, "summary", self.cfg.market_poll_seconds):
+                self._mark_polled(ticker, "summary")
                 obs = await self.md.fetch_summary(ticker)
                 self._record_summary_tick(obs)
             due_conf = self.paper.confirmation_due_at()
-            need_book = st.last_book_poll is None or (now - st.last_book_poll).total_seconds() >= self.cfg.orderbook_poll_seconds
+            need_book = self._poll_due(ticker, "book", self.cfg.orderbook_poll_seconds)
             if due_conf is not None and now >= due_conf and (st.last_book_poll is None or st.last_book_poll < due_conf):
                 need_book = True
+            if window is not None and st.book is not None:
+                placed = parse_ts(window["created_at"])
+                if placed is not None and st.book.requested_at < placed:
+                    need_book = True  # just entered: evaluate the orders on a book taken after they exist
             if need_book:
+                self._mark_polled(ticker, "book")
                 market = st.summary.market if st.summary else market
                 book = await self.md.fetch_book(ticker, market)
                 if book is not None:

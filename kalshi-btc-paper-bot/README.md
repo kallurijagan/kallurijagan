@@ -284,7 +284,7 @@ delay, entry grace, pair-accounting mode. Strategy parameters are edited in **Se
 
 ## Tests
 
-`.\test.ps1` runs 104 deterministic backend tests and type-checks and builds the dashboard. They
+`.\test.ps1` runs 113 deterministic backend tests and type-checks and builds the dashboard. They
 cover:
 
 - the schedule, including Chicago DST, and market and side mapping;

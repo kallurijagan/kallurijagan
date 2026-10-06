@@ -26,6 +26,10 @@ class Clock:
     def now(self) -> datetime:
         return datetime.now(UTC)
 
+    def raw_now(self) -> datetime:
+        """This computer's own clock, never skew-corrected (used for the engine lease)."""
+        return self.now()
+
     def monotonic(self) -> float:
         return time.monotonic()
 
@@ -33,36 +37,66 @@ class Clock:
 class SkewCorrectedClock(Clock):
     """Wall clock aligned to Kalshi server time when this computer's clock is off.
 
-    The offset (server minus local, from HTTP Date headers) is applied only when it is at least
-    ``threshold`` seconds, rounded to whole seconds, and only changed when it moves by a full
-    second, so ordinary jitter never makes time step backwards.
+    * The measured offset (Kalshi minus local, from HTTP Date headers) is applied only when it is
+      at least ``enter`` seconds; it is dropped again only below ``exit`` seconds, and re-rounded
+      only when the measurement moves by ``rearm`` seconds or more (no flapping on jitter).
+    * If the local wall clock STEPS (Windows time sync, manual change) or the process was
+      suspended, the wall-vs-monotonic drift exceeds ``step_tolerance``: the stored samples are
+      discarded (``reset_fn``) and the correction restarts from the raw clock, so a step is never
+      counted twice.
+    Elapsed-time measurements in the engine use ``monotonic()``, which offset changes do not move.
     """
 
-    def __init__(self, base: Clock | None = None, threshold: float = 2.0):
+    def __init__(self, base: Clock | None = None, enter: float = 2.0, exit: float = 1.0, rearm: float = 1.5,
+                 step_tolerance: float = 2.0):
         self.base = base or Clock()
-        self.threshold = threshold
+        self.enter, self.exit, self.rearm, self.step_tolerance = enter, exit, rearm, step_tolerance
         self._offset_fn = None
+        self._reset_fn = None
         self._applied = 0.0
+        self._last_pair: tuple[datetime, float] | None = None
+        self.discontinuities = 0
 
-    def attach(self, offset_fn) -> None:
+    def attach(self, offset_fn, reset_fn=None) -> None:
         self._offset_fn = offset_fn
+        self._reset_fn = reset_fn
 
     @property
     def measured_offset(self) -> float | None:
         return self._offset_fn() if self._offset_fn else None
 
+    def _check_discontinuity(self) -> datetime:
+        wall, mono = self.base.now(), self.base.monotonic()
+        if self._last_pair is not None:
+            drift = (wall - self._last_pair[0]).total_seconds() - (mono - self._last_pair[1])
+            if abs(drift) > self.step_tolerance:
+                self.discontinuities += 1
+                self._applied = 0.0
+                if self._reset_fn is not None:
+                    self._reset_fn()
+        self._last_pair = (wall, mono)
+        return wall
+
     @property
     def applied_offset(self) -> float:
-        measured = self.measured_offset
-        if measured is None:
+        m = self.measured_offset
+        if m is None:
             return self._applied
-        target = float(round(measured)) if abs(measured) >= self.threshold else 0.0
-        if abs(target - self._applied) >= 1.0:
-            self._applied = target
+        if self._applied == 0.0:
+            if abs(m) >= self.enter:
+                self._applied = float(round(m))
+        elif abs(m) < self.exit:
+            self._applied = 0.0
+        elif abs(m - self._applied) >= self.rearm:
+            self._applied = float(round(m))
         return self._applied
 
+    def raw_now(self) -> datetime:
+        return self.base.now()
+
     def now(self) -> datetime:
-        return self.base.now() + timedelta(seconds=self.applied_offset)
+        wall = self._check_discontinuity()
+        return wall + timedelta(seconds=self.applied_offset)
 
     def monotonic(self) -> float:
         return self.base.monotonic()

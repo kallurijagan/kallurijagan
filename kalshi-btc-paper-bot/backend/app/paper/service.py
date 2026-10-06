@@ -356,6 +356,8 @@ def describe_gate(order: OrderView, res, book: OrderBook, execution_delay: float
     detail = res.detail or {}
     base = {"book_requested_at": iso(book.requested_at), "limit": s(order.limit_price),
             "best_ask": detail.get("best_ask"), "best_ask_size": detail.get("best_ask_size")}
+    if res.blocked and "predates" in res.blocked:
+        return {**base, "state": "no_book", "text": "Waiting for the first order-book observation after the order was placed"}
     if res.blocked:
         return {**base, "state": "blocked", "text": f"Not filling: {res.blocked}"}
     if res.legs:

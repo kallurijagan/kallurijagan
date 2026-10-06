@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { safeStorageGet, safeStorageSet, sendJSON, usePoll } from "./api";
+import { safeStorageGet, safeStorageSet, sendJSON, useNow, usePoll } from "./api";
 import { FillDialog, Modal, ResetDialog, SettingsDialog } from "./components/Dialogs";
 import { Header } from "./components/Header";
 import { LayoutChooser } from "./components/LayoutChooser";
@@ -21,6 +21,18 @@ function initialLayout(): LayoutId {
 }
 
 type Dialog = null | { kind: "settings" } | { kind: "reset" } | { kind: "layout" } | { kind: "pricecheck" } | { kind: "fill"; id: string };
+
+/** Ticks every second so the age of the shown data keeps counting while the backend is unreachable. */
+function StaleBanner(props: { error: string; okAt: number | null }) {
+  const now = useNow(1000);
+  return (
+    <div className="alert alert-bad" role="alert">
+      <strong>The local engine is not responding</strong> ({props.error}). Showing data from{" "}
+      {props.okAt ? `${Math.round((now - props.okAt) / 1000)}s ago` : "earlier"}. If you clicked inside the start.ps1
+      window, press Esc there; otherwise check that start.ps1 is still running.
+    </div>
+  );
+}
 
 export default function App() {
   const { data: state, error, reload, okAt } = usePoll<AppState>("/api/state", 1000);
@@ -102,13 +114,7 @@ export default function App() {
     <AppCtx.Provider value={ctx}>
       <div className={`app app--${layout} ${state.preview ? "is-preview" : ""}`}>
         <Header />
-        {error && (
-          <div className="alert alert-bad" role="alert">
-            <strong>The local engine is not responding</strong> ({error}). Showing data from{" "}
-            {okAt ? `${Math.round((Date.now() - okAt) / 1000)}s ago` : "earlier"}. If you clicked inside the start.ps1
-            window, press Esc there; otherwise check that start.ps1 is still running.
-          </div>
-        )}
+        {error && <StaleBanner error={error} okAt={okAt} />}
         {state.engine.last_tick_error && <div className="alert alert-bad">Engine error: {state.engine.last_tick_error}</div>}
         <main>
           {layout === "simple" && <SimpleLayout />}

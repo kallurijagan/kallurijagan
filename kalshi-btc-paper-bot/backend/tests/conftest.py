@@ -160,7 +160,7 @@ def clock() -> ManualClock:
     return ManualClock(T(14, 58, 0))
 
 
-def make_engine(tmp_path: Path, clock: ManualClock, source: FakeSource, fee_mode: str = "none",
+def make_engine(tmp_path: Path, clock, source, fee_mode: str = "none",
                 pair_accounting: str = "net_on_fill", db_name: str = "paper.sqlite3", **cfg_over) -> Engine:
     cfg = load_config(data_dir=tmp_path, pair_accounting=pair_accounting, **cfg_over)
     conn = connect(tmp_path / db_name)

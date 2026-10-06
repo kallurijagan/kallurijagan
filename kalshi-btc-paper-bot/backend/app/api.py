@@ -230,7 +230,9 @@ def _clock_info(eng: Engine) -> dict:
     measured = getattr(eng.clock, "measured_offset", None)
     applied = getattr(eng.clock, "applied_offset", 0.0)
     return {"measured_offset_seconds": round(measured, 1) if measured is not None else None,
-            "applied_offset_seconds": applied, "source": "HTTP Date header from Kalshi"}
+            "applied_offset_seconds": applied, "source": "HTTP Date header from Kalshi",
+            "clock_steps_detected": getattr(eng.clock, "discontinuities", 0),
+            "tls": getattr(eng.md.source, "tls_mode", None)}
 
 
 def _gate_for(eng: Engine, o: sqlite3.Row) -> dict:
@@ -257,26 +259,32 @@ def _diagnosis(eng: Engine, now: datetime, settings, est, trading_state: str, ws
     def add(key: str, status: str, title: str, detail: str = "") -> None:
         checks.append({"key": key, "status": status, "title": title, "detail": detail})
 
+    mins_text = ", ".join(f":{m:02d}" for m in settings.eligible_minutes)
+    limit_c = s(settings.limit_price * 100)
     nxt_text = (f"{nxt[0].astimezone(tz):%H:%M %Z} (in {max(0, int((nxt[0] - now).total_seconds() // 60))} min)"
                 if nxt else "the next eligible window")
 
-    # 1. engine loop
-    tick_age = (now - eng.last_tick_at).total_seconds() if eng.last_tick_at else None
+    # 1. engine loop (monotonic timing: clock corrections never look like a stall)
+    mono = eng.clock.monotonic()
+    started, done = eng.tick_started_mono, eng.last_tick_done_mono
+    stall_limit = 30.0  # a tick can legitimately wait ~14 s on one slow request with host failover
     if eng.last_tick_error:
         add("engine", "block", "Engine error", eng.last_tick_error)
-    elif tick_age is None or tick_age > 10:
-        add("engine", "block", "Engine is not running its loop",
-            f"Last tick {tick_age:.0f}s ago. If you clicked inside the start.ps1 window, press Esc there; "
-            "otherwise restart start.ps1." if tick_age is not None else "The engine has not ticked yet.")
+    elif started is None:
+        add("engine", "wait", "Engine starting…")
+    elif done is not None and done >= started and mono - done <= 10:
+        add("engine", "ok", "Engine running", f"last cycle {mono - done:.1f}s ago")
+    elif mono - started <= stall_limit:
+        add("engine", "wait", "Waiting on a Kalshi request", f"{mono - started:.0f}s so far (slow network or failover)")
     else:
-        add("engine", "ok", "Engine running", f"last tick {tick_age:.1f}s ago")
-    if eng.last_gap and (now - parse_ts(eng.last_gap["to"])).total_seconds() < 3600:
-        add("gap", "info", "Engine was paused recently", eng.last_gap["message"])
-
+        since = mono - (done if done is not None else started)
+        add("engine", "block", "Engine is not running its loop",
+            f"No completed cycle for {since:.0f}s. If you clicked inside the start.ps1 window, press Esc there; "
+            "otherwise restart start.ps1.")
     # 2. trading switch
     if trading_state == "stopped":
-        add("trading", "block", "Trading has not been started", "Press Start. Entries begin at the next window "
-            "that starts at :00, :15 or :30.")
+        add("trading", "block", "Trading has not been started", f"Press Start. Entries begin at the next window "
+            f"that starts at {mins_text}.")
     elif trading_state == "paused":
         add("trading", "block", "Trading is paused", "Press Resume. Entries begin at the next eligible window.")
     else:
@@ -285,14 +293,20 @@ def _diagnosis(eng: Engine, now: datetime, settings, est, trading_state: str, ws
     # 3. market data
     h = eng.md.health
     if eng.cfg.is_preview:
-        add("data", "info", "Preview mode", "Synthetic sample data, not live Kalshi prices.")
+        add("preview", "info", "Preview mode", "Synthetic sample data, not live Kalshi prices.")
     if h.state in ("error", "rate_limited"):
         add("data", "block", "Cannot get live Kalshi data" if h.state == "error" else "Kalshi rate limit — waiting",
             h.last_error or "")
     elif h.state == "starting":
         add("data", "wait", "Connecting to Kalshi…")
     else:
-        add("data", "ok", "Live market data OK", f"source {eng.md.source.base_url}")
+        add("data", "ok", "Sample data OK (preview)" if eng.cfg.is_preview else "Live market data OK",
+            f"source {eng.md.source.base_url}")
+    tls = getattr(eng.md.source, "tls_mode", None)
+    if tls == "bundled":
+        add("tls", "info", "HTTPS uses Python's bundled certificate list",
+            "Run setup.ps1 again to install 'truststore' so the Windows certificate store is used "
+            "(needed if antivirus or a proxy scans HTTPS).")
 
     # 4. clock
     measured = getattr(eng.clock, "measured_offset", None)
@@ -314,9 +328,15 @@ def _diagnosis(eng: Engine, now: datetime, settings, est, trading_state: str, ws
         per_order = settings.limit_price * settings.contracts_per_side + max_fee_reservation(
             sched, settings.contracts_per_side, settings.limit_price, settings.fee_mode)
         need = per_order * 2
-        if account["available"] < need:
-            add("funds", "block", "Not enough available paper cash",
-                f"A window needs ${s(need)} reserved; available is ${s(account['available'])}.")
+        # Cash that will be free for the NEXT window: the current window's reservations are released at its close.
+        avail_next = account["available"]
+        if cur_row is not None and cur_row["status"] == "active":
+            for o in (current or {}).get("orders", []):
+                if o["status"] in acc.WORKING_STATUSES:
+                    avail_next += D(o["reserved_remaining"])
+        if avail_next < need:
+            add("funds", "block", "Not enough paper cash for the next window",
+                f"A window needs ${s(need)} reserved; ${s(avail_next)} will be available.")
     except Exception:  # noqa: BLE001 - diagnostics must never break the state endpoint
         pass
 
@@ -325,7 +345,7 @@ def _diagnosis(eng: Engine, now: datetime, settings, est, trading_state: str, ws
     armed = parse_ts(est["armed_at"])
     if not eligible:
         add("window", "wait", f"This window ({ws.astimezone(tz):%H:%M}) is skipped by the schedule",
-            f"Only windows starting at {', '.join(f':{m:02d}' for m in settings.eligible_minutes)} are traded. "
+            f"Only windows starting at {mins_text} are traded. "
             f"Next entry: {nxt_text}.")
     elif cur_row is not None and cur_row["status"] == "skipped":
         category = _skip_category(cur_row["skip_reason"])
@@ -342,6 +362,10 @@ def _diagnosis(eng: Engine, now: datetime, settings, est, trading_state: str, ws
         add("window", "wait", "Entering this window…", eng.entry_status.get("message", ""))
     elif cur_row is not None and cur_row["status"] == "active":
         add("window", "ok", f"Orders placed for {cur_row['market_ticker']}")
+    elif cur_row is not None:
+        reasons = sorted({o.get("close_reason") or "" for o in (current or {}).get("orders", [])} - {""})
+        add("window", "wait", f"This window's orders are closed ({cur_row['status'].replace('_', ' ')})",
+            f"{'; '.join(reasons) + '. ' if reasons else ''}No more entries in this window. Next entry: {nxt_text}.")
 
     # 8. book + orders
     if st is not None and st.book is not None and not st.book_valid:
@@ -370,10 +394,10 @@ def _diagnosis(eng: Engine, now: datetime, settings, est, trading_state: str, ws
         detail = blocks[0]["detail"]
     elif waiting_bits:
         prefix = f"{'; '.join(filled_bits)}. " if filled_bits else ""
-        headline, status = (f"{prefix}Orders are live, waiting for a seller at {s(settings.limit_price * 100)}c or "
+        headline, status = (f"{prefix}Orders are live, waiting for a seller at {limit_c}c or "
                             f"less ({', '.join(waiting_bits)})"), "waiting_for_price"
         detail = ("This is normal. Most 15-minute windows fill on at most one side: a fill needs BTC to move far "
-                  "enough that one side's ask drops to the limit. A bid or last trade at 37c does not count.")
+                  f"enough that one side's ask drops to the limit. A bid or last trade at {limit_c}c does not count.")
     elif waits:
         headline, status, detail = f"Waiting: {waits[0]['title']}", "waiting", waits[0]["detail"]
     else:

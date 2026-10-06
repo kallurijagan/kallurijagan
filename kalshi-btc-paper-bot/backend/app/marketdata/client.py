@@ -97,7 +97,7 @@ async def _guard_hook(request: httpx.Request) -> None:
     assert_read_only(request.method, str(request.url), request.headers)
 
 
-def _tls_context() -> ssl.SSLContext | bool:
+def _tls_context() -> tuple[ssl.SSLContext | bool, str]:
     """Verify HTTPS with the operating system's certificate store (Windows store on Windows).
 
     Antivirus HTTPS scanning and corporate proxies install their own root certificate in the
@@ -107,15 +107,31 @@ def _tls_context() -> ssl.SSLContext | bool:
     try:
         import truststore
 
-        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT), "os-store"
     except Exception as exc:  # noqa: BLE001 - fall back to httpx's default (certifi) verification
-        log.warning("OS certificate store unavailable (%s); using the bundled CA list", exc)
-        return True
+        log.warning("OS certificate store unavailable (%s); using Python's bundled CA list. "
+                    "Run setup.ps1 again to install 'truststore'.", exc)
+        return True, "bundled"
+
+
+_UNTRUSTED_MARKERS = ("certificate_verify_failed", "certificate verify failed", "not trusted by the trust provider",
+                      "certificate chain", "cert_e_", "self-signed certificate", "unable to get local issuer")
+_EXPIRED_MARKERS = ("not within its validity period", "has expired", "certificate is not yet valid", "cert_e_expired")
 
 
 def _explain(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}"
-    if "CERTIFICATE_VERIFY_FAILED" in text or "certificate verify failed" in text.lower():
+    chain = []
+    e: BaseException | None = exc
+    while e is not None and len(chain) < 6:
+        chain.append(e)
+        e = e.__cause__ or e.__context__
+    lowered = " ".join(f"{type(x).__name__} {x}" for x in chain).lower()
+    is_cert = any(isinstance(x, ssl.SSLCertVerificationError) for x in chain)
+    if any(m in lowered for m in _EXPIRED_MARKERS):
+        text += (" — the certificate looks expired or not yet valid: check this computer's date and time "
+                 "(Settings > Time & language > Date & time > Sync now).")
+    elif is_cert or any(m in lowered for m in _UNTRUSTED_MARKERS):
         text += (" — HTTPS to Kalshi is being intercepted (antivirus HTTPS scanning or a network proxy) with a "
                  "certificate this computer does not trust. Exclude python.exe from HTTPS scanning, or ask your "
                  "network admin.")
@@ -150,9 +166,10 @@ class KalshiReadOnlyClient:
         self._min_interval = min_interval
         self._last_request = 0.0
         self._lock = asyncio.Lock()
+        verify, self.tls_mode = _tls_context() if transport is None else (True, "test-transport")
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout, connect=min(3.0, timeout)),
-            verify=_tls_context() if transport is None else True,
+            verify=verify,
             headers={"Accept": "application/json", "User-Agent": "kalshi-btc-paper-bot/1.0 (paper trading; read-only)"},
             event_hooks={"request": [_guard_hook]},
             transport=transport,
@@ -166,6 +183,10 @@ class KalshiReadOnlyClient:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+
+    def reset_clock_samples(self) -> None:
+        """Forget Date-header samples (called when the local clock steps or the PC resumed)."""
+        self._offset_samples.clear()
 
     @property
     def clock_offset_seconds(self) -> float | None:
