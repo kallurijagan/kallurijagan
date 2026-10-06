@@ -1,0 +1,23 @@
+# local configuration (no secrets expected, but keep machine-specific settings out of git)
+.env
+
+# runtime data: databases, engine lock, logs
+data/*
+!data/.gitkeep
+
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node / build output (setup.ps1 rebuilds frontend/dist)
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
