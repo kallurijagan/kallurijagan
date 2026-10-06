@@ -9,6 +9,7 @@ import { useApp } from "../context";
 import { ago, cents, fmtTime, fmtUtc, qty, usd } from "../format";
 import type { PriceTick } from "../types";
 import { FeedAlert } from "./SimpleLayout";
+import { WhyPanel } from "../components/WhyPanel";
 
 export function TerminalLayout() {
   const { state, tz } = useApp();
@@ -47,6 +48,7 @@ export function TerminalLayout() {
         </div>
       </div>
       <FeedAlert />
+      <WhyPanel compact />
       <div className="term-grid">
         <div className="term-col">
           <Card dense title="Order book depth"><OrderBookPanel /></Card>
@@ -72,7 +74,7 @@ export function TerminalLayout() {
                         <td>{o.side}</td><td>{cents(o.limit_price)}</td><td>{qty(o.quantity)}</td><td>{qty(o.filled_qty)}</td>
                         <td>{qty(o.remaining_qty)}</td><td>{o.avg_fill_price ? cents(o.avg_fill_price) : "—"}</td><td>{usd(o.reserved_remaining)}</td>
                         <td><Pill status={o.settled ? "settled" : o.status} /></td>
-                        <td className="note-cell">{o.gate ?? o.close_reason ?? ""}</td>
+                        <td className="note-cell">{o.gate?.text ?? o.close_reason ?? ""}</td>
                         <td className="mono">{fmtTime(o.submitted_at, tz)}</td>
                       </tr>
                     ))}

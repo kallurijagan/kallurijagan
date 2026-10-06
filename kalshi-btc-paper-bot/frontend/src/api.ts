@@ -2,8 +2,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 export class ApiError extends Error {}
 
-export async function getJSON<T>(url: string): Promise<T> {
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
+export async function getJSON<T>(url: string, timeoutMs = 5000): Promise<T> {
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, { headers: { Accept: "application/json" }, signal: ctrl.signal });
+  } catch (e) {
+    throw new ApiError(ctrl.signal.aborted ? `no response from the local engine within ${timeoutMs / 1000}s` : String(e));
+  } finally {
+    window.clearTimeout(timer);
+  }
   if (!res.ok) {
     let detail = res.statusText;
     try {
@@ -32,6 +41,7 @@ export async function sendJSON<T>(url: string, method: "POST" | "PUT", body?: un
 export function usePoll<T>(url: string | null, intervalMs: number) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [okAt, setOkAt] = useState<number | null>(null);
   const urlRef = useRef(url);
   urlRef.current = url;
 
@@ -43,6 +53,7 @@ export function usePoll<T>(url: string | null, intervalMs: number) {
       if (urlRef.current === u) {
         setData(d);
         setError(null);
+        setOkAt(Date.now());
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -64,7 +75,7 @@ export function usePoll<T>(url: string | null, intervalMs: number) {
     };
   }, [url, intervalMs, load]);
 
-  return { data, error, reload: load };
+  return { data, error, reload: load, okAt };
 }
 
 /** Wall clock that ticks, used for countdowns (corrected by the server clock offset). */

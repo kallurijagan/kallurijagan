@@ -67,6 +67,8 @@ class TickerState:
     resync_requested: str | None = None
     last_resync_at: datetime | None = None
     last_book_poll: datetime | None = None
+    next_book_seq: int = 0
+    accepted_book_seq: int = -1
     last_summary_poll: datetime | None = None
     rejected_out_of_order: int = 0
     invalid_after_resync: int = 0
@@ -106,6 +108,7 @@ class MarketDataService:
         self.series: SeriesInfo | None = None
         self.fee_changes: list[FeeChange] = []
         self.series_fetched_at: datetime | None = None
+        self.fee_changes_error: str | None = None
         self.tickers: dict[str, TickerState] = {}
         self._discovery: dict[datetime, tuple[datetime, MarketCheck]] = {}
 
@@ -170,10 +173,21 @@ class MarketDataService:
         return status
 
     async def refresh_series(self) -> SeriesInfo | None:
-        series = await self._call(f"series {self.series_ticker}", lambda: self.source.get_series(self.series_ticker))
+        try:
+            series = await self._call(f"series {self.series_ticker}", lambda: self.source.get_series(self.series_ticker))
+        except KalshiNotFound as exc:
+            self._fail(exc, f"series {self.series_ticker}")
+            return None
         if series is None:
             return None
-        changes = await self._call("series fee changes", lambda: self.source.get_series_fee_changes(self.series_ticker))
+        # Scheduled fee changes are optional information: a failure here must not discard the
+        # series fee structure, but it is recorded so the fee estimate is flagged as uncertain.
+        try:
+            changes = await self._call("series fee changes", lambda: self.source.get_series_fee_changes(self.series_ticker))
+            self.fee_changes_error = None if changes is not None else (self.health.last_error or "unavailable")
+        except KalshiNotFound as exc:
+            changes = None
+            self.fee_changes_error = f"GET /series/fee_changes: {exc}"
         self.series = series
         self.fee_changes = changes or []
         self.series_fetched_at = self.clock.now()
@@ -185,7 +199,12 @@ class MarketDataService:
         now = self.clock.now()
         if cached:
             at, chk = cached
-            if chk.ok or not chk.retryable or (now - at).total_seconds() < retry_seconds:
+            if chk.ok:
+                return chk
+            # A failure seen BEFORE the window started (next-window prefetch, market not open yet)
+            # is never final: re-check as soon as the window has started.
+            stale_prefetch = at < window_start <= now
+            if not stale_prefetch and (not chk.retryable or (now - at).total_seconds() < retry_seconds):
                 return chk
         lo = int(window_end.timestamp()) - 60
         hi = int(window_end.timestamp()) + 60
@@ -222,6 +241,8 @@ class MarketDataService:
 
     async def fetch_book(self, ticker: str, market: MarketInfo | None, allow_resync: bool = True) -> OrderBook | None:
         st = self.state(ticker)
+        seq = st.next_book_seq  # request order (immune to wall-clock steps)
+        st.next_book_seq += 1
         try:
             book = await self._call(f"orderbook {ticker}", lambda: self.source.get_orderbook(ticker))
         except KalshiNotFound as exc:
@@ -230,10 +251,13 @@ class MarketDataService:
         if book is None:
             return None
         st.last_book_poll = book.requested_at
-        if st.book is not None and book.requested_at <= st.book.requested_at:
+        if seq < st.accepted_book_seq:
+            # A newer request (e.g. a dashboard-triggered fresh comparison) already completed.
             st.rejected_out_of_order += 1
-            log.warning("rejected out-of-order book for %s (%s <= %s)", ticker, book.requested_at, st.book.requested_at)
+            log.warning("rejected out-of-order book for %s (request #%d older than accepted #%d)",
+                        ticker, seq, st.accepted_book_seq)
             return None
+        st.accepted_book_seq = seq
         problems = validate_book(book, market)
         if problems and allow_resync:
             log.warning("invalid book for %s (%s); resynchronizing", ticker, "; ".join(problems))

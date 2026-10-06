@@ -80,3 +80,13 @@ def test_price_check_compare_endpoint_validates_and_records(tmp_path):
         r = c.post("/api/price-check/compare", json={"side": "UP", "quote_type": "unknown", "price": "37"})
         assert r.status_code == 200 and r.json()["comparison"]["verdict"] == "inconclusive"
         assert len(c.get("/api/price-check/comparisons").json()["comparisons"]) == 1
+
+
+def test_state_includes_why_not_buying_diagnosis(tmp_path):
+    with make_client(tmp_path) as c:
+        d = c.get("/api/state").json()["diagnosis"]
+        assert d["status"] == "blocked" and "not been started" in d["headline"]
+        assert {ch["key"] for ch in d["checks"]} >= {"engine", "trading", "data"}
+        c.post("/api/control/start")
+        d = c.get("/api/state").json()["diagnosis"]
+        assert "not been started" not in d["headline"]

@@ -23,7 +23,7 @@ function initialLayout(): LayoutId {
 type Dialog = null | { kind: "settings" } | { kind: "reset" } | { kind: "layout" } | { kind: "pricecheck" } | { kind: "fill"; id: string };
 
 export default function App() {
-  const { data: state, error, reload } = usePoll<AppState>("/api/state", 1000);
+  const { data: state, error, reload, okAt } = usePoll<AppState>("/api/state", 1000);
   const [layout, setLayoutState] = useState<LayoutId>(initialLayout);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [toast, setToast] = useState<{ msg: string; kind: "info" | "error" } | null>(null);
@@ -102,7 +102,13 @@ export default function App() {
     <AppCtx.Provider value={ctx}>
       <div className={`app app--${layout} ${state.preview ? "is-preview" : ""}`}>
         <Header />
-        {error && <div className="alert alert-bad">Lost connection to the local backend ({error}). Showing the last known state.</div>}
+        {error && (
+          <div className="alert alert-bad" role="alert">
+            <strong>The local engine is not responding</strong> ({error}). Showing data from{" "}
+            {okAt ? `${Math.round((Date.now() - okAt) / 1000)}s ago` : "earlier"}. If you clicked inside the start.ps1
+            window, press Esc there; otherwise check that start.ps1 is still running.
+          </div>
+        )}
         {state.engine.last_tick_error && <div className="alert alert-bad">Engine error: {state.engine.last_tick_error}</div>}
         <main>
           {layout === "simple" && <SimpleLayout />}

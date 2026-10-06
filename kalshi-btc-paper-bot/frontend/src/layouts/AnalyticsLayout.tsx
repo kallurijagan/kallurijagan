@@ -7,6 +7,7 @@ import { useApp } from "../context";
 import { OUTCOME_LABEL, pct, pnlClass, qty, usd, cents } from "../format";
 import type { Analytics, EquityPoint } from "../types";
 import { FeedAlert } from "./SimpleLayout";
+import { WhyPanel } from "../components/WhyPanel";
 
 export function AnalyticsLayout() {
   const { state, tz } = useApp();
@@ -17,6 +18,7 @@ export function AnalyticsLayout() {
   return (
     <div className="layout-analytics">
       <FeedAlert />
+      <WhyPanel compact />
       <div className="caveat" role="note">
         <strong>How to read this:</strong> {d?.caveat ?? "Performance is measured per complete market window."} Fills are simulated estimates from
         displayed order-book depth, not exchange executions; fees are estimates.

@@ -31,7 +31,7 @@ param(
     [switch]$Dev,
     [switch]$LiveCheck,
     [switch]$NoBrowser,
-    [int]$Port = 8000
+    [int]$Port = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,6 +39,16 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Backend = Join-Path $Root "backend"
 $Frontend = Join-Path $Root "frontend"
 $VenvPy = Join-Path $Backend ".venv\Scripts\python.exe"
+
+# Port: -Port wins, then KBOT_PORT from .env, then 8000.
+if ($Port -le 0) {
+    $Port = 8000
+    $EnvFile = Join-Path $Root ".env"
+    if (Test-Path $EnvFile) {
+        $line = Get-Content $EnvFile | Where-Object { $_ -match '^\s*KBOT_PORT\s*=\s*(\d+)' } | Select-Object -First 1
+        if ($line -and ($line -match '(\d+)\s*$')) { $Port = [int]$Matches[1] }
+    }
+}
 $Url = "http://127.0.0.1:$Port"
 
 if (-not (Test-Path $VenvPy)) {
@@ -106,12 +116,20 @@ if ($Preview) {
 Write-Host "Dashboard: $Url" -ForegroundColor Green
 Write-Host "Logs:      $(Join-Path $Root 'data\logs')"
 Write-Host "Keep this window open. Press Ctrl+C (or run .\stop.ps1) to stop gracefully."
+Write-Host "Tip: do not click inside this window. If its title starts with 'Select', press Esc."
+Write-Host "While trading is enabled the bot asks Windows not to sleep; closing the lid may still suspend it."
 Write-Host ""
 
 if (-not $NoBrowser) {
     $target = $Url
     if ($Dev) { $target = "http://127.0.0.1:5173" }
-    Start-Job -ScriptBlock { param($u) Start-Sleep -Seconds 4; Start-Process $u } -ArgumentList $target | Out-Null
+    # Open the browser only once the backend answers (startup can take a few seconds).
+    Start-Job -ScriptBlock {
+        param($health, $u)
+        for ($i = 0; $i -lt 90; $i++) {
+            try { Invoke-RestMethod -Uri $health -TimeoutSec 2 | Out-Null; Start-Process $u; return } catch { Start-Sleep -Seconds 1 }
+        }
+    } -ArgumentList "$Url/api/health", $target | Out-Null
 }
 
 Push-Location $Backend

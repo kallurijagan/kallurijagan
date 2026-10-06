@@ -42,9 +42,30 @@ session: `Set-ExecutionPolicy -Scope Process Bypass`.
 
 **Keep it running.** The engine runs inside the backend process, not in the browser. Closing the
 browser tab does not stop trading. Shutting down or sleeping the computer, or closing the
-start.ps1 window, does stop it. After a restart it recovers open orders and positions and resumes
-settlement checks. It never invents fills for time it was offline, and it waits for the next
-eligible window before entering again.
+start.ps1 window, does stop it. While trading is enabled the bot asks Windows not to go to sleep,
+but closing a laptop lid can still suspend it. **Don't click inside the start.ps1 window**: the bot
+turns off the console's QuickEdit mode, but if the window title ever starts with "Select", press
+Esc. After a restart it recovers open orders and positions and resumes settlement checks. It
+never invents fills for time it was offline, and it waits for the next eligible window before
+entering again. Offline gaps are recorded in the activity log.
+
+## "Why isn't it buying?"
+
+Every layout has a **"Why isn't it buying?"** panel at the top. It gives one plain answer and a
+checklist behind it. The common answers, in order of likelihood:
+
+| The panel says | What it means / what to do |
+|---|---|
+| *Orders are live, waiting for a seller at 37c or less (UP best ask 51c, ...)* | **Normal.** The orders exist and are watching the book. A fill needs someone selling at 37¢ or less, which takes a big enough BTC move that one side becomes cheap. Most windows fill one side or none. A bid or last trade at 37¢ does not count. |
+| *Trading has not been started* / *Trading is paused* | Press **Start** / **Resume** (there's a button right in the panel). |
+| *Waiting for the next window — started after this one began* | Start, Resume or a restart after a window began waits for the next :00/:15/:30 window. The :45 window is always skipped. |
+| *Waiting: Entering this window…* | Up to 30 s after the window opens, the bot waits for Kalshi to publish the market's target price and mark it active. |
+| *Cannot get live Kalshi data* | Your PC can't reach Kalshi. Run `.\start.ps1 -LiveCheck`. It prints the real error and a hint, for example for antivirus HTTPS scanning, DNS/VPN problems, or a 403 from Kalshi/your network. |
+| *This window was skipped: …* | The stated reason applies to that window only; the next window is tried again. |
+| *Engine is not running its loop* | The backend is frozen or stopped. Press Esc in the start.ps1 window, or restart it. |
+
+Each order card also shows its own reason, for example *Waiting for price: best UP ask is 51c x 20,
+needs <= 37c (14c away)* or *No offers: nobody is selling UP right now*.
 
 ---
 
@@ -244,6 +265,16 @@ winning individual legs is not evidence that this two-sided strategy is profitab
   never substitutes sample or random data.
 - **WebSockets are not used.** They need API credentials, and public REST provides everything
   this strategy needs. No credentials are read, stored or logged.
+- **HTTPS** is verified against the Windows certificate store (via `truststore`). That way
+  antivirus HTTPS scanning or a corporate proxy that the browser trusts doesn't break the Kalshi
+  connection, and certificates are still fully checked.
+- **Clock.** Window timing follows Kalshi's server clock, measured from the HTTP `Date` header.
+  If your PC clock is off by 2 s or more, the engine corrects for it and the panel suggests
+  syncing Windows time.
+- **Market listing timing.** Kalshi may list the next market before its window opens and fill in
+  the target price at the open. Fields that aren't filled in yet are re-checked until the 30 s
+  entry grace. Only structural mismatches (wrong market type, range market, a strike type where
+  YES isn't UP, a different window) skip a window immediately.
 
 ## Configuration
 
@@ -253,7 +284,7 @@ delay, entry grace, pair-accounting mode. Strategy parameters are edited in **Se
 
 ## Tests
 
-`.\test.ps1` runs 89 deterministic backend tests and type-checks and builds the dashboard. They
+`.\test.ps1` runs 104 deterministic backend tests and type-checks and builds the dashboard. They
 cover:
 
 - the schedule, including Chicago DST, and market and side mapping;
@@ -281,5 +312,9 @@ cover:
   computer to confirm live connectivity. If Kalshi changes the market structure, validation will
   skip windows with a stated reason rather than guess.
 - The engine runs only while your computer and the backend window are running.
+- Kalshi's live market and order-book responses could not be observed from the build
+  environment. The pre-open listing behaviour is handled defensively (see above). If something
+  still doesn't match, the "Why isn't it buying?" panel and `.\start.ps1 -LiveCheck`, which also
+  shows how the next window's market is listed, will show the exact reason.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for architecture, data model and implementation choices.

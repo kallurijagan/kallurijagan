@@ -36,7 +36,36 @@ def test_valid_15_minute_market_maps_up_to_yes():
 def test_rejects_hourly_market_with_same_close():
     hourly = mk(open_time=(START - timedelta(minutes=45)).isoformat())
     chk = validate_window_market([hourly], "KXBTC15M", START, END)
-    assert not chk.ok and "not a 15-minute window market" in chk.reason
+    assert not chk.ok and not chk.retryable and "not a 15-minute window market" in chk.reason
+    late = mk(open_time=(START + timedelta(minutes=5)).isoformat())
+    assert "after the window start" in validate_window_market([late], "KXBTC15M", START, END).reason
+
+
+def test_market_listed_a_few_minutes_early_is_accepted_with_warning():
+    early = mk(open_time=(START - timedelta(minutes=3)).isoformat())
+    chk = validate_window_market([early], "KXBTC15M", START, END)
+    assert chk.ok and any("opened early" in w for w in chk.warnings)
+
+
+def test_not_yet_filled_fields_are_retryable_but_structural_mismatches_are_not():
+    for over, text in (({"floor_strike": None}, "not set yet"), ({"strike_type": None}, "not set yet"),
+                       ({"rules_primary": ""}, "not published yet")):
+        chk = validate_window_market([mk(**over)], "KXBTC15M", START, END)
+        assert not chk.ok and chk.retryable and text in chk.reason, over
+    for over in ({"strike_type": "less"}, {"cap_strike": 63000}, {"market_type": "scalar"},
+                 {"notional_value_dollars": "10.0000"}):
+        chk = validate_window_market([mk(**over)], "KXBTC15M", START, END)
+        assert not chk.ok and not chk.retryable, over
+
+
+def test_event_ticker_in_repeated_dst_hour_matches_either_instant():
+    from datetime import datetime, timezone
+    # 2026-11-01 01:30 New York happens twice: 05:30Z (EDT) and 06:30Z (EST).
+    start = datetime(2026, 11, 1, 6, 15, tzinfo=timezone.utc)
+    m = MarketInfo.from_api(market_payload(start, event_ticker="KXBTC15M-26NOV010130",
+                                           ticker="KXBTC15M-26NOV010130-30"))
+    chk = validate_window_market([m], "KXBTC15M", start, start + timedelta(minutes=15))
+    assert chk.ok, chk.reason
 
 
 def test_rejects_other_series_and_wrong_close():
@@ -60,7 +89,8 @@ def test_rejects_unverifiable_up_down_mapping():
 def test_rejects_ambiguous_and_ticker_time_mismatch():
     a = mk()
     b = mk(ticker=a.ticker + "B")
-    assert "Ambiguous" in validate_window_market([a, b], "KXBTC15M", START, END).reason
+    amb = validate_window_market([a, b], "KXBTC15M", START, END)
+    assert "Ambiguous" in amb.reason and amb.retryable
     bad = mk(event_ticker="KXBTC15M-26OCT061100", ticker="KXBTC15M-26OCT061100-00")
     assert "encodes close" in validate_window_market([bad], "KXBTC15M", START, END).reason
 

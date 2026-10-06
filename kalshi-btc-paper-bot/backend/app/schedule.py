@@ -30,6 +30,44 @@ class Clock:
         return time.monotonic()
 
 
+class SkewCorrectedClock(Clock):
+    """Wall clock aligned to Kalshi server time when this computer's clock is off.
+
+    The offset (server minus local, from HTTP Date headers) is applied only when it is at least
+    ``threshold`` seconds, rounded to whole seconds, and only changed when it moves by a full
+    second, so ordinary jitter never makes time step backwards.
+    """
+
+    def __init__(self, base: Clock | None = None, threshold: float = 2.0):
+        self.base = base or Clock()
+        self.threshold = threshold
+        self._offset_fn = None
+        self._applied = 0.0
+
+    def attach(self, offset_fn) -> None:
+        self._offset_fn = offset_fn
+
+    @property
+    def measured_offset(self) -> float | None:
+        return self._offset_fn() if self._offset_fn else None
+
+    @property
+    def applied_offset(self) -> float:
+        measured = self.measured_offset
+        if measured is None:
+            return self._applied
+        target = float(round(measured)) if abs(measured) >= self.threshold else 0.0
+        if abs(target - self._applied) >= 1.0:
+            self._applied = target
+        return self._applied
+
+    def now(self) -> datetime:
+        return self.base.now() + timedelta(seconds=self.applied_offset)
+
+    def monotonic(self) -> float:
+        return self.base.monotonic()
+
+
 class ManualClock(Clock):
     def __init__(self, start: datetime):
         self._now = start.astimezone(UTC)
@@ -140,6 +178,27 @@ _MONTHS = {m: i for i, m in enumerate(
 
 
 def parse_event_ticker_close(event_ticker: str, series_ticker: str) -> datetime | None:
+    candidates = parse_event_ticker_close_candidates(event_ticker, series_ticker)
+    return candidates[0] if candidates else None
+
+
+def parse_event_ticker_close_candidates(event_ticker: str, series_ticker: str) -> list[datetime]:
+    """All UTC instants the New York wall time in the ticker can denote.
+
+    Usually one; two during the repeated 1 AM hour when daylight saving time ends.
+    """
+    local = _parse_event_ticker_local(event_ticker, series_ticker)
+    if local is None:
+        return []
+    out: list[datetime] = []
+    for fold in (0, 1):
+        utc = local.replace(fold=fold, tzinfo=NEW_YORK).astimezone(UTC)
+        if utc not in out:
+            out.append(utc)
+    return out
+
+
+def _parse_event_ticker_local(event_ticker: str, series_ticker: str) -> datetime | None:
     """Parse the close time encoded in a 15-minute event ticker.
 
     Observed format: ``KXBTC15M-26OCT021330`` = 2026-10-02 13:30 America/New_York, which is
@@ -158,6 +217,6 @@ def parse_event_ticker_close(event_ticker: str, series_ticker: str) -> datetime 
         day = int(stamp[5:7])
         hour = int(stamp[7:9])
         minute = int(stamp[9:11])
-        return datetime(year, month, day, hour, minute, tzinfo=NEW_YORK).astimezone(UTC)
+        return datetime(year, month, day, hour, minute)
     except (KeyError, ValueError):
         return None

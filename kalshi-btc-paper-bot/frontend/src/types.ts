@@ -31,7 +31,32 @@ export interface OrderRow {
   first_fill_at: string | null;
   last_fill_at: string | null;
   closed_at: string | null;
-  gate?: string | null;
+  gate?: OrderGate | null;
+}
+
+export interface OrderGate {
+  state: string; // blocked | stale | no_book | waiting_for_price | no_offers | revalidating | filled | liquidity_used
+  text: string;
+  best_ask?: string | null;
+  best_ask_size?: string | null;
+  limit?: string;
+  cents_away?: string;
+  book_requested_at?: string;
+}
+
+export interface DiagnosisCheck {
+  key: string;
+  status: "ok" | "wait" | "block" | "info";
+  title: string;
+  detail: string;
+}
+
+export interface Diagnosis {
+  headline: string;
+  status: "blocked" | "waiting" | "waiting_for_price" | "ok";
+  detail: string;
+  checks: DiagnosisCheck[];
+  next_entry_at: string | null;
 }
 
 export interface WindowRow {
@@ -276,6 +301,7 @@ export interface AppState {
     fee_type: string;
     fee_multiplier: string;
     uncertain: boolean;
+    changes_error?: string | null;
     taker_rate: string;
     formula: string;
     source: string;
@@ -283,6 +309,9 @@ export interface AppState {
   };
   settings: Settings;
   events: { ts: string; level: string; kind: string; message: string; window_id: string | null }[];
+  diagnosis: Diagnosis;
+  clock: { measured_offset_seconds: number | null; applied_offset_seconds: number; source: string };
+  last_gap: { from: string; to: string; seconds: number; message: string } | null;
 }
 
 export interface Settings {

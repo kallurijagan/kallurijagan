@@ -200,8 +200,7 @@ class OrderBook:
         fmt = "orderbook_fp"
         book = payload.get("orderbook_fp")
         if isinstance(book, dict):
-            if "yes_dollars" not in book or "no_dollars" not in book:
-                problems.append("orderbook_fp is missing yes_dollars or no_dollars (incomplete response)")
+            # A side with no bids may be omitted or null: that is an empty side (no quote), not an error.
             yes_raw, no_raw, cents = book.get("yes_dollars") or [], book.get("no_dollars") or [], False
         else:
             legacy = payload.get("orderbook")

@@ -27,8 +27,8 @@ from .marketdata.models import NO, YES, OrderBook
 from .marketdata.pricecheck import Tick, compare_visible_price
 from .money import ZERO, D, s
 from .paper import accounting as acc
-from .paper.fees import FeeSchedule, estimate_fee, resolve_schedule
-from .schedule import WINDOW, hour_slots, iso, next_eligible_starts, parse_ts, window_start_for
+from .paper.fees import FeeSchedule, estimate_fee, max_fee_reservation, resolve_schedule
+from .schedule import WINDOW, hour_slots, is_eligible_start, iso, next_eligible_starts, parse_ts, window_start_for
 from .settings_store import SettingsError, load_settings, update_settings
 
 router = APIRouter(prefix="/api")
@@ -216,10 +216,170 @@ async def state(request: Request) -> dict:
         "current_window": current,
         "open_windows": open_windows,
         "recent_fills": fills,
-        "fee_model": fee_sched.to_json() if fee_sched else None,
+        "fee_model": ({**fee_sched.to_json(), "changes_error": eng.md.fee_changes_error,
+                       "uncertain": fee_sched.uncertain or bool(eng.md.fee_changes_error)} if fee_sched else None),
+        "clock": _clock_info(eng),
+        "last_gap": eng.last_gap,
+        "diagnosis": _diagnosis(eng, now, settings, est, trading_state, ws, cur_row, current, nxt, st, fee_sched, summary),
         "settings": settings.to_json(),
         "events": events,
     }
+
+
+def _clock_info(eng: Engine) -> dict:
+    measured = getattr(eng.clock, "measured_offset", None)
+    applied = getattr(eng.clock, "applied_offset", 0.0)
+    return {"measured_offset_seconds": round(measured, 1) if measured is not None else None,
+            "applied_offset_seconds": applied, "source": "HTTP Date header from Kalshi"}
+
+
+def _gate_for(eng: Engine, o: sqlite3.Row) -> dict:
+    now = eng.clock.now()
+    gate = eng.paper.order_gate.get(o["id"])
+    if gate is None:
+        err = eng.md.health.last_error if eng.md.health.state != "ok" else None
+        return {"state": "no_book", "text": "Waiting for the first order-book observation for this order"
+                + (f" ({err})" if err else "")}
+    at = parse_ts(gate.get("book_requested_at"))
+    if at is not None and (now - at).total_seconds() > max(2 * eng.cfg.stale_after_seconds, 10):
+        err = eng.md.health.last_error if eng.md.health.state != "ok" else "no new order book received"
+        return {**gate, "state": "stale", "text": f"No fresh order book for {(now - at).total_seconds():.0f}s — "
+                                                  f"fills paused ({err})"}
+    return gate
+
+
+def _diagnosis(eng: Engine, now: datetime, settings, est, trading_state: str, ws: datetime, cur_row,
+               current: dict | None, nxt: list, st, fee_sched, account: dict) -> dict:
+    """One plain-language answer to "why isn't it buying?" plus the checklist behind it."""
+    tz = ZoneInfo(settings.display_timezone)
+    checks: list[dict] = []
+
+    def add(key: str, status: str, title: str, detail: str = "") -> None:
+        checks.append({"key": key, "status": status, "title": title, "detail": detail})
+
+    nxt_text = (f"{nxt[0].astimezone(tz):%H:%M %Z} (in {max(0, int((nxt[0] - now).total_seconds() // 60))} min)"
+                if nxt else "the next eligible window")
+
+    # 1. engine loop
+    tick_age = (now - eng.last_tick_at).total_seconds() if eng.last_tick_at else None
+    if eng.last_tick_error:
+        add("engine", "block", "Engine error", eng.last_tick_error)
+    elif tick_age is None or tick_age > 10:
+        add("engine", "block", "Engine is not running its loop",
+            f"Last tick {tick_age:.0f}s ago. If you clicked inside the start.ps1 window, press Esc there; "
+            "otherwise restart start.ps1." if tick_age is not None else "The engine has not ticked yet.")
+    else:
+        add("engine", "ok", "Engine running", f"last tick {tick_age:.1f}s ago")
+    if eng.last_gap and (now - parse_ts(eng.last_gap["to"])).total_seconds() < 3600:
+        add("gap", "info", "Engine was paused recently", eng.last_gap["message"])
+
+    # 2. trading switch
+    if trading_state == "stopped":
+        add("trading", "block", "Trading has not been started", "Press Start. Entries begin at the next window "
+            "that starts at :00, :15 or :30.")
+    elif trading_state == "paused":
+        add("trading", "block", "Trading is paused", "Press Resume. Entries begin at the next eligible window.")
+    else:
+        add("trading", "ok", "Trading enabled")
+
+    # 3. market data
+    h = eng.md.health
+    if eng.cfg.is_preview:
+        add("data", "info", "Preview mode", "Synthetic sample data, not live Kalshi prices.")
+    if h.state in ("error", "rate_limited"):
+        add("data", "block", "Cannot get live Kalshi data" if h.state == "error" else "Kalshi rate limit — waiting",
+            h.last_error or "")
+    elif h.state == "starting":
+        add("data", "wait", "Connecting to Kalshi…")
+    else:
+        add("data", "ok", "Live market data OK", f"source {eng.md.source.base_url}")
+
+    # 4. clock
+    measured = getattr(eng.clock, "measured_offset", None)
+    if measured is not None and abs(measured) > 5:
+        direction = "behind" if measured > 0 else "ahead of"
+        add("clock", "info", f"Your PC clock is {abs(measured):.0f}s {direction} Kalshi — corrected automatically",
+            "Windows Settings > Time & language > Date & time > Sync now fixes it permanently.")
+
+    # 5. exchange + fees
+    ex = eng.md.exchange
+    if ex is not None and not (ex.exchange_active and ex.trading_active):
+        add("exchange", "block", "Kalshi reports trading is paused", "Maintenance or outside trading hours.")
+    if eng.md.series is None and h.state == "ok":
+        add("fees", "wait", "Fee schedule not loaded yet", "Entries wait until the series fee structure is known.")
+
+    # 6. funds for the next window
+    try:
+        sched = fee_sched or FeeSchedule("", "quadratic", D("1"), None, "", "")
+        per_order = settings.limit_price * settings.contracts_per_side + max_fee_reservation(
+            sched, settings.contracts_per_side, settings.limit_price, settings.fee_mode)
+        need = per_order * 2
+        if account["available"] < need:
+            add("funds", "block", "Not enough available paper cash",
+                f"A window needs ${s(need)} reserved; available is ${s(account['available'])}.")
+    except Exception:  # noqa: BLE001 - diagnostics must never break the state endpoint
+        pass
+
+    # 7. this window
+    eligible = is_eligible_start(ws, settings.eligible_minutes, settings.display_timezone)
+    armed = parse_ts(est["armed_at"])
+    if not eligible:
+        add("window", "wait", f"This window ({ws.astimezone(tz):%H:%M}) is skipped by the schedule",
+            f"Only windows starting at {', '.join(f':{m:02d}' for m in settings.eligible_minutes)} are traded. "
+            f"Next entry: {nxt_text}.")
+    elif cur_row is not None and cur_row["status"] == "skipped":
+        category = _skip_category(cur_row["skip_reason"])
+        if category in ("Started or resumed mid-window", "Scheduled skip (:45 window)"):
+            add("window", "wait", "Waiting for the next window — started after this one began",
+                f"{cur_row['skip_reason']}. Next entry: {nxt_text}.")
+        else:
+            add("window", "block", f"This window ({ws.astimezone(tz):%H:%M}) was skipped",
+                f"{cur_row['skip_reason'] or ''} Next attempt: {nxt_text}.")
+    elif trading_state == "running" and armed is not None and armed > ws and cur_row is None:
+        add("window", "wait", "Started after this window began",
+            f"Started at {armed.astimezone(tz):%H:%M:%S}; the first entry is at the next eligible window: {nxt_text}.")
+    elif cur_row is None and trading_state == "running":
+        add("window", "wait", "Entering this window…", eng.entry_status.get("message", ""))
+    elif cur_row is not None and cur_row["status"] == "active":
+        add("window", "ok", f"Orders placed for {cur_row['market_ticker']}")
+
+    # 8. book + orders
+    if st is not None and st.book is not None and not st.book_valid:
+        add("book", "block", "Order book failed validation — fills paused", "; ".join(st.book_problems[:3]))
+    waiting_bits = []
+    filled_bits = []
+    for o in (current or {}).get("orders", []) if cur_row is not None and cur_row["status"] == "active" else []:
+        gate = o.get("gate") or {}
+        if o["status"] == "filled":
+            add(f"order-{o['side']}", "ok", f"{o['side']} filled {o['filled_qty']}/{o['quantity']}")
+            filled_bits.append(f"{o['side']} filled {o['filled_qty']}/{o['quantity']}")
+            continue
+        state = gate.get("state", "")
+        status = "block" if state in ("blocked", "stale") else ("ok" if state in ("revalidating", "filled") else "wait")
+        add(f"order-{o['side']}", status, f"{o['side']} order: {o['filled_qty']}/{o['quantity']} filled",
+            gate.get("text", ""))
+        if state == "waiting_for_price" and gate.get("best_ask"):
+            waiting_bits.append(f"{o['side']} best ask {s(D(gate['best_ask']) * 100)}c")
+        elif state == "no_offers":
+            waiting_bits.append(f"no {o['side']} sellers")
+
+    blocks = [c for c in checks if c["status"] == "block"]
+    waits = [c for c in checks if c["status"] == "wait"]
+    if blocks:
+        headline, status = f"Not buying: {blocks[0]['title']}", "blocked"
+        detail = blocks[0]["detail"]
+    elif waiting_bits:
+        prefix = f"{'; '.join(filled_bits)}. " if filled_bits else ""
+        headline, status = (f"{prefix}Orders are live, waiting for a seller at {s(settings.limit_price * 100)}c or "
+                            f"less ({', '.join(waiting_bits)})"), "waiting_for_price"
+        detail = ("This is normal. Most 15-minute windows fill on at most one side: a fill needs BTC to move far "
+                  "enough that one side's ask drops to the limit. A bid or last trade at 37c does not count.")
+    elif waits:
+        headline, status, detail = f"Waiting: {waits[0]['title']}", "waiting", waits[0]["detail"]
+    else:
+        headline, status, detail = "Everything is working", "ok", ""
+    return {"headline": headline, "status": status, "detail": detail, "checks": checks,
+            "next_entry_at": iso(nxt[0]) if nxt else None}
 
 
 def _book_block(book: OrderBook, st, now: datetime) -> dict:
@@ -303,7 +463,7 @@ def _window_detail(conn: sqlite3.Connection, w: sqlite3.Row, eng: Engine) -> dic
         od["remaining_qty"] = s(D(o["quantity"]) - D(o["filled_qty"]))
         od["avg_fill_price"] = s((D(o["principal_cost"]) / D(o["filled_qty"])).quantize(Decimal("0.0001"))) if D(o["filled_qty"]) > 0 else None
         od["display_status"] = "settled" if o["settled"] else o["status"]
-        od["gate"] = eng.paper.order_gate.get(o["id"]) if o["status"] in acc.WORKING_STATUSES else None
+        od["gate"] = _gate_for(eng, o) if o["status"] in acc.WORKING_STATUSES else None
         d["orders"].append(od)
     up, down = D(w["up_qty"]), D(w["down_qty"])
     pairs = min(up, down)

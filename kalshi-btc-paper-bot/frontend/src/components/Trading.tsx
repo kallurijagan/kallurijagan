@@ -6,6 +6,7 @@ import { Empty, KalshiLink, Pill, useWindowCountdown } from "./common";
 /** The current hour's four windows; the :45 window is visibly skipped. */
 export function ScheduleStrip(props: { compact?: boolean }) {
   const { state, tz } = useApp();
+  const running = state.engine.state === "running";
   const { remaining } = useWindowCountdown();
   return (
     <div className={`schedule ${props.compact ? "compact" : ""}`} role="list" aria-label={`Hourly schedule (${tz})`}>
@@ -18,9 +19,16 @@ export function ScheduleStrip(props: { compact?: boolean }) {
         >
           <div className="slot-label">{s.label}</div>
           <div className="slot-state">
-            {!s.eligible ? "Skipped (:45)" : s.status === "upcoming" ? "Trade" : s.status === "current" ? "Not entered" : s.status.replace(/_/g, " ")}
+            {!s.eligible
+              ? `Skipped (:${s.label.slice(3, 5)})`
+              : s.status === "upcoming"
+                ? running ? "Will trade" : "Eligible (not started)"
+                : s.status === "current"
+                  ? "Not entered"
+                  : s.status.replace(/_/g, " ")}
           </div>
           {s.is_current && <div className="slot-count">{countdown(remaining)} left</div>}
+          {s.note && s.status === "skipped" && s.eligible && <div className="slot-note">{s.note}</div>}
           {s.net_pnl !== null && <div className={`slot-pnl ${Number(s.net_pnl) >= 0 ? "pos" : "neg"}`}>{usd(s.net_pnl, { sign: true })}</div>}
         </div>
       ))}
@@ -82,7 +90,7 @@ export function OrderCard(props: { order: OrderRow | undefined; side: "UP" | "DO
         <div><dt>Est. fees</dt><dd>{usd(o.fees_paid)}</dd></div>
         <div><dt>Reserved</dt><dd>{usd(o.reserved_remaining)}</dd></div>
       </dl>
-      {o.gate && <div className="oc-gate" title="Why the order is/isn't filling right now">{o.gate}</div>}
+      {o.gate && <div className={`oc-gate gate-${o.gate.state}`} title="Why the order is/isn't filling right now">{o.gate.text}</div>}
       {o.close_reason && o.status !== "filled" && <div className="oc-gate muted">{o.close_reason}</div>}
     </div>
   );

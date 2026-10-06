@@ -27,13 +27,16 @@ def main() -> int:
 
     from .config import load_config
     from .main import create_app
+    from .winpower import disable_quick_edit
+
+    disable_quick_edit()  # a click in the console window must not freeze the engine
 
     cfg = load_config()
     if cfg.host not in ("127.0.0.1", "localhost", "::1"):
         print(f"WARNING: binding to {cfg.host} exposes the dashboard beyond this computer.", file=sys.stderr)
     app = create_app(cfg)
     server = uvicorn.Server(uvicorn.Config(app, host=cfg.host, port=cfg.port, log_level=cfg.log_level.lower(),
-                                           access_log=False))
+                                           access_log=False, log_config=None))
     app.state.uvicorn_server = server  # lets stop.ps1 request a graceful shutdown
     server.run()
     return 0

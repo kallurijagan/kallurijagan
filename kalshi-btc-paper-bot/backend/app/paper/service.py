@@ -48,7 +48,7 @@ class PaperExecutionService:
         self.pair_accounting = pair_accounting
         self.settlement_delay_warning = settlement_delay_warning
         self.triggers: dict[str, Trigger] = {}
-        self.order_gate: dict[str, str] = {}
+        self.order_gate: dict[str, dict] = {}
 
     # ------------------------------------------------------------------ setup
     def ensure_initialized(self, starting_balance: Decimal) -> int:
@@ -88,6 +88,8 @@ class PaperExecutionService:
         """Start or resume: new entries only from the next window that STARTS after now."""
         now = self.clock.now()
         with tx(self.conn):
+            if self.engine_state()["trading_enabled"]:
+                return  # already running: pressing Start again must not re-arm and skip the current window
             self.conn.execute(
                 "UPDATE engine_state SET trading_enabled=1, armed_at=?, paused_at=NULL, updated_at=? WHERE id=1",
                 (iso(now), iso(now)),
@@ -255,7 +257,7 @@ class PaperExecutionService:
                     self.triggers[o["id"]] = res.trigger
                 else:
                     self.triggers.pop(o["id"], None)
-                self.order_gate[o["id"]] = res.blocked or ("revalidating executable liquidity" if res.trigger else "working")
+                self.order_gate[o["id"]] = describe_gate(view, res, book, self.execution_delay)
                 if res.event:
                     events.append(("info", f"{o['side']} order: {res.event}", window["id"]))
                 if res.legs:
@@ -345,6 +347,37 @@ class PaperExecutionService:
     def snapshot(self, reason: str) -> None:
         with tx(self.conn):
             acc.snapshot_equity(self.conn, self.account_id, self.clock.now(), reason)
+
+
+def describe_gate(order: OrderView, res, book: OrderBook, execution_delay: float) -> dict:
+    """Plain-language reason why an order is or isn't filling right now."""
+    side_name = order.side
+    opposite = "NO" if order.kalshi_side == "yes" else "YES"
+    detail = res.detail or {}
+    base = {"book_requested_at": iso(book.requested_at), "limit": s(order.limit_price),
+            "best_ask": detail.get("best_ask"), "best_ask_size": detail.get("best_ask_size")}
+    if res.blocked:
+        return {**base, "state": "blocked", "text": f"Not filling: {res.blocked}"}
+    if res.legs:
+        qty = sum((leg.quantity for leg in res.legs), D("0"))
+        return {**base, "state": "filled", "text": f"Filled {s(qty)} just now"}
+    if res.trigger is not None:
+        return {**base, "state": "revalidating",
+                "text": f"{side_name} ask at or below {s(order.limit_price)} seen ({s(res.trigger.executable_qty)} contracts); "
+                        f"confirming on a fresh order book after the {execution_delay:.0f}s execution delay"}
+    best = detail.get("best_ask")
+    if best is None:
+        return {**base, "state": "no_offers",
+                "text": f"No offers: nobody is selling {side_name} right now (no {opposite} bids on the book)"}
+    best_d = D(best)
+    if best_d > order.limit_price:
+        away = (best_d - order.limit_price) * 100
+        return {**base, "state": "waiting_for_price", "cents_away": s(away),
+                "text": f"Waiting for price: best {side_name} ask is {s(best_d * 100)}c x {detail.get('best_ask_size')}, "
+                        f"needs <= {s(order.limit_price * 100)}c ({s(away)}c away). Normal - fills need a big BTC move."}
+    return {**base, "state": "liquidity_used",
+            "text": f"Asks at or below {s(order.limit_price * 100)}c are size this order already used; "
+                    "waiting for new sellers (no liquidity is counted twice)"}
 
 
 def _fee_schedule_from_json(text: str | None) -> FeeSchedule:

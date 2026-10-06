@@ -77,9 +77,12 @@ def test_validation_flags_malformed_levels():
     assert "non-numeric" in text
 
 
-def test_missing_side_key_is_incomplete():
-    b = OrderBook.from_api("X", {"orderbook_fp": {"yes_dollars": []}}, NOW, NOW)
-    assert any("incomplete" in p for p in b.parse_problems)
+def test_omitted_side_is_an_empty_side_but_missing_book_is_a_problem():
+    b = OrderBook.from_api("X", {"orderbook_fp": {"yes_dollars": [["0.40", "5.00"]]}}, NOW, NOW)
+    assert not b.parse_problems and b.no_bids == () and b.best_ask(YES) is None
+    assert b.best_ask(NO).price == Dec("0.60")
+    missing = OrderBook.from_api("X", {"unexpected": {}}, NOW, NOW)
+    assert any("no orderbook_fp" in p for p in missing.parse_problems)
 
 
 def test_tick_size_validation_against_market_price_ranges():

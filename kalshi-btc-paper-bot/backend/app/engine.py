@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from .config import Config
 from .db import tx
+from .winpower import keep_awake
 from .instance_lock import EngineAlreadyRunning, FileLock, acquire_lease, heartbeat, new_owner_id, release_lease
 from .marketdata.discovery import MarketCheck, market_url, validate_window_market
 from .marketdata.feed import MarketDataService, Source, SummaryObs
@@ -61,6 +62,7 @@ class Engine:
         self._settle_due: dict[str, datetime] = {}
         self._processed_book_at: dict[str, datetime] = {}
         self._last_tick_rec: dict[tuple[str, str], tuple[tuple, datetime]] = {}
+        self.last_gap: dict | None = None
         self.ticks = 0
 
     # ------------------------------------------------------------------ lifecycle
@@ -91,6 +93,8 @@ class Engine:
 
     async def stop(self) -> None:
         self._stopping.set()
+        if self.use_locks:
+            keep_awake(False)
         if self._task is not None:
             try:
                 await asyncio.wait_for(self._task, timeout=15)
@@ -131,6 +135,24 @@ class Engine:
             except asyncio.TimeoutError:
                 pass
 
+    def _retry_soon(self, key: str, now: datetime, seconds: float = 5.0) -> None:
+        self._due[key] = now + timedelta(seconds=seconds)
+
+    def _detect_gap(self, now: datetime) -> None:
+        """Record when the engine was not running (PC asleep, console frozen, overloaded)."""
+        prev = self.last_tick_at
+        if prev is None:
+            return
+        gap = (now - prev).total_seconds()
+        if gap <= max(15.0, 5 * self.cfg.tick_seconds):
+            return
+        tz = ZoneInfo(load_settings(self.conn).display_timezone)
+        msg = (f"engine was not running from {prev.astimezone(tz):%H:%M:%S} to {now.astimezone(tz):%H:%M:%S %Z} "
+               f"({gap:.0f}s) — computer asleep, console window frozen by a click/selection, or system overloaded")
+        self.last_gap = {"from": iso(prev), "to": iso(now), "seconds": round(gap, 1), "message": msg}
+        self._entry_block = msg
+        self.paper.log_event("warn", "engine", msg.capitalize())
+
     def _due_now(self, key: str, interval: float, now: datetime) -> bool:
         nxt = self._due.get(key)
         if nxt is None or now >= nxt:
@@ -142,16 +164,23 @@ class Engine:
     async def tick(self) -> None:
         now = self.clock.now()
         self.ticks += 1
+        self._detect_gap(now)
         self.last_tick_at = now
+        trading = bool(self.paper.engine_state()["trading_enabled"])
+        if self.use_locks:
+            keep_awake(trading)
         if self.use_locks and self._due_now("lease", 5, now):
             heartbeat(self.conn, self.owner, now)
         if self._due_now("exchange", self.cfg.exchange_status_poll_seconds, now):
-            await self.md.refresh_exchange()
+            if await self.md.refresh_exchange() is None:
+                self._retry_soon("exchange", now)  # a skipped/failed refresh must not wait a full interval
         if self.md.series is None:
             if self._due_now("series_retry", 15, now):
-                await self.md.refresh_series()
+                if await self.md.refresh_series() is None:
+                    self._retry_soon("series_retry", now)
         elif self._due_now("series", self.cfg.fee_schedule_refresh_seconds, now):
-            await self.md.refresh_series()
+            if await self.md.refresh_series() is None:
+                self._retry_soon("series", now)
 
         settings = load_settings(self.conn)
         ws = window_start_for(now)
@@ -162,7 +191,7 @@ class Engine:
             if close is not None and now >= close:
                 self.paper.close_window(w["id"], "expired", "market close: unfilled remainder canceled")
 
-        chk = await self.md.discover(ws, we)
+        chk = await self.md.discover(ws, we, retry_seconds=2.0)
         await self._entry(now, ws, we, settings, chk)
 
         active = self.paper.active_windows()
@@ -226,6 +255,10 @@ class Engine:
                 self.paper.skip(ws, we, True, block, ticker)
                 self._entry_block = None
             else:
+                if block != self._entry_block:
+                    self.paper.log_event("info", "entry-wait", f"Window {local:%H:%M %Z}: waiting to enter — {block}",
+                                         acc.window_id_for(self.paper.account_id, ws),
+                                         dedupe_key=f"wait:{iso(ws)}:{block[:80]}")
                 self._entry_block = block
                 self.entry_status = {"state": "waiting", "message": f"Waiting to enter ({late:.0f}s into window): {block}"}
             return
@@ -292,11 +325,11 @@ class Engine:
         summary = await self.md.fetch_summary(chk.market.ticker)
         if summary is None:
             return f"market summary unavailable: {self.md.health.last_error}", False, None
+        if summary.market.status != "active":
+            return f"market status is {summary.market.status!r} (waiting for 'active')", False, None
         recheck = validate_window_market([summary.market], self.cfg.series_ticker, ws, we)
         if not recheck.ok:
             return f"market re-validation failed: {recheck.reason}", not recheck.retryable, None
-        if summary.market.status != "active":
-            return f"market status is {summary.market.status!r} (waiting for 'active')", False, None
         tick = summary.market.tick_problem(settings.limit_price)
         if tick:
             return f"limit price not valid for this market: {tick}", True, None
@@ -333,7 +366,6 @@ class Engine:
             return
         if self._processed_book_at.get(ticker) == st.book.requested_at:
             return
-        self._processed_book_at[ticker] = st.book.requested_at
         ex = self.md.exchange
         self.paper.process_book(
             window, st.book, st.book_problems,
@@ -343,6 +375,7 @@ class Engine:
             exchange_status_at=ex.fetched_at if ex else None,
             fee_waiver_until=summary.market.fee_waiver_expiration_time if summary else None,
         )
+        self._processed_book_at[ticker] = st.book.requested_at
 
     def _should_record(self, ticker: str, kind: str, values: tuple, at: datetime) -> bool:
         """Record a price tick when top-of-book changes, or at least every 5 s as a heartbeat."""

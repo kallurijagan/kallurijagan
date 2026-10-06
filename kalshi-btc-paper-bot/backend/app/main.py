@@ -6,8 +6,10 @@ stops (Ctrl+C in the start.ps1 window performs a graceful shutdown).
 
 from __future__ import annotations
 
+import atexit
 import logging
 import logging.handlers
+import queue
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,12 +25,17 @@ from .engine import Engine
 from .instance_lock import EngineAlreadyRunning
 from .marketdata.client import KalshiReadOnlyClient
 from .marketdata.preview import PreviewSource
-from .schedule import Clock
+from .schedule import Clock, SkewCorrectedClock
 
 log = logging.getLogger("kbot")
 
 
 def setup_logging(cfg: Config) -> None:
+    """Console + rotating file logs, written from a background thread.
+
+    Handlers run on a QueueListener thread so a slow or blocked console (e.g. a text selection
+    in the Windows console) can never stall the engine's event loop.
+    """
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
     root = logging.getLogger()
     if getattr(root, "_kbot_configured", False):
@@ -37,11 +44,17 @@ def setup_logging(cfg: Config) -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     console = logging.StreamHandler()
     console.setFormatter(fmt)
-    root.addHandler(console)
     log_file = cfg.log_dir / ("preview.log" if cfg.is_preview else "paper-bot.log")
     fileh = logging.handlers.RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
     fileh.setFormatter(fmt)
-    root.addHandler(fileh)
+    q: queue.SimpleQueue = queue.SimpleQueue()
+    listener = logging.handlers.QueueListener(q, console, fileh, respect_handler_level=True)
+    listener.start()
+    atexit.register(listener.stop)
+    root.addHandler(logging.handlers.QueueHandler(q))
+    for name in ("uvicorn", "uvicorn.error"):
+        logging.getLogger(name).handlers = []  # propagate to root -> also lands in data/logs
+        logging.getLogger(name).propagate = True
     logging.getLogger("httpx").setLevel(logging.WARNING)
     root._kbot_configured = True  # type: ignore[attr-defined]
 
@@ -49,7 +62,11 @@ def setup_logging(cfg: Config) -> None:
 def build_source(cfg: Config, clock: Clock):
     if cfg.is_preview:
         return PreviewSource(clock, cfg.series_ticker)
-    return KalshiReadOnlyClient(cfg.kalshi_base_url, cfg.kalshi_fallback_base_url, cfg.http_timeout_seconds, now=clock.now)
+    client = KalshiReadOnlyClient(cfg.kalshi_base_url, cfg.kalshi_fallback_base_url, cfg.http_timeout_seconds,
+                                  now=clock.now)
+    if isinstance(clock, SkewCorrectedClock):
+        clock.attach(lambda: client.clock_offset_seconds)
+    return client
 
 
 def create_app(cfg: Config | None = None, engine_factory=None) -> FastAPI:
@@ -58,7 +75,7 @@ def create_app(cfg: Config | None = None, engine_factory=None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        clock = Clock()
+        clock = SkewCorrectedClock() if not cfg.is_preview else Clock()
         conn = connect(cfg.db_path)
         init_schema(conn)
         engine = engine_factory(cfg, conn, clock) if engine_factory else Engine(cfg, conn, build_source(cfg, clock), clock)

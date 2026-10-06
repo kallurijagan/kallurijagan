@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { usePoll } from "../api";
 import { Card, Stat, useWindowCountdown } from "../components/common";
-import { ExposureLine, MarketHeader, NextWindows, OrderCard, ScheduleStrip, WindowList } from "../components/Trading";
+import { EventsFeed, ExposureLine, MarketHeader, NextWindows, OrderCard, ScheduleStrip, WindowList } from "../components/Trading";
+import { WhyPanel } from "../components/WhyPanel";
 import { useApp } from "../context";
 import { fmtTime, pnlClass, usd } from "../format";
 import type { WindowRow } from "../types";
@@ -44,6 +45,7 @@ export function SimpleLayout() {
   return (
     <div className="layout-simple">
       <FeedAlert />
+      <WhyPanel />
       <section className="simple-hero" aria-label="Account">
         <Stat big label="Paper equity" value={usd(a.equity)} sub={`Started with ${usd(a.starting_balance)}`} />
         <Stat big label="Total P&L" value={usd(a.total_pnl, { sign: true })} tone={pnlClass(a.total_pnl)}
@@ -100,6 +102,10 @@ export function SimpleLayout() {
           <WindowList compact windows={settled.data?.windows ?? []} empty="No settled windows yet." />
         </Card>
       </div>
+      <details className="card simple-log">
+        <summary>Activity log (entries, waits, skips, fills, settlements)</summary>
+        <div className="card-body"><EventsFeed limit={40} /></div>
+      </details>
     </div>
   );
 }

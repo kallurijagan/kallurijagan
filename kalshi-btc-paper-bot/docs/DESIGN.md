@@ -112,6 +112,23 @@ fill or settlement.
     Control actions run on the loop between ticks, so they can't interleave with a fill
     transaction.
 
+12. **Retry vs skip.** Validation failures are either *structural* (skip the window now) or
+    *not-ready-yet* (no market listed, `floor_strike`/`strike_type`/rules not filled in,
+    several candidates), which are re-checked every ~2 s until the 30 s entry grace expires. A
+    failure cached by the next-window prefetch, before the window started, is always re-checked
+    at the window start.
+13. **Clock.** `SkewCorrectedClock` applies Kalshi's server time (the median of HTTP `Date`
+    header samples, whole seconds, with hysteresis) when the PC clock is off by 2 s or more.
+    Out-of-order book detection uses a request sequence number, not wall-clock time.
+14. **Windows robustness.** It verifies TLS against the OS certificate store, writes logs from a
+    queue thread so a blocked console can't stall the event loop, disables console QuickEdit,
+    prevents system sleep while trading is enabled, and records engine gaps (sleep or freeze) in
+    the event log.
+15. **Diagnosis.** `/api/state.diagnosis` ranks the checks (engine loop, trading switch, data
+    feed, clock, exchange, fees, funds, schedule and window state, book validity, per-order
+    gate) into one headline. Each order's gate explains in words why it is or isn't filling,
+    for example "best ask 51c, needs <= 37c (14c away)".
+
 ## API (all responses carry `"paper": true`)
 
 `GET /api/state` (everything the dashboards show), `/api/windows`, `/api/orders`, `/api/fills`,

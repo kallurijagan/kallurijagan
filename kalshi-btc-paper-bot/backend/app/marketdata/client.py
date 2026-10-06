@@ -13,7 +13,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime
+import ssl
+import statistics
+from collections import deque
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -93,6 +97,33 @@ async def _guard_hook(request: httpx.Request) -> None:
     assert_read_only(request.method, str(request.url), request.headers)
 
 
+def _tls_context() -> ssl.SSLContext | bool:
+    """Verify HTTPS with the operating system's certificate store (Windows store on Windows).
+
+    Antivirus HTTPS scanning and corporate proxies install their own root certificate in the
+    Windows store; browsers trust it, but Python's bundled list would not, breaking every
+    Kalshi request. ``truststore`` keeps full certificate verification while using the OS store.
+    """
+    try:
+        import truststore
+
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception as exc:  # noqa: BLE001 - fall back to httpx's default (certifi) verification
+        log.warning("OS certificate store unavailable (%s); using the bundled CA list", exc)
+        return True
+
+
+def _explain(exc: Exception) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    if "CERTIFICATE_VERIFY_FAILED" in text or "certificate verify failed" in text.lower():
+        text += (" — HTTPS to Kalshi is being intercepted (antivirus HTTPS scanning or a network proxy) with a "
+                 "certificate this computer does not trust. Exclude python.exe from HTTPS scanning, or ask your "
+                 "network admin.")
+    elif isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError)) and "getaddrinfo" in text.lower():
+        text += " — DNS lookup failed: check the internet connection, VPN or DNS filtering."
+    return text
+
+
 class KalshiReadOnlyClient:
     """Async client for Kalshi public market data."""
 
@@ -108,6 +139,7 @@ class KalshiReadOnlyClient:
         now: Callable[[], datetime] | None = None,
     ):
         self._now = now or (lambda: datetime.now(UTC))
+        self._offset_samples: deque[float] = deque(maxlen=15)
         self._bases = [base_url.rstrip("/")]
         if fallback_base_url and fallback_base_url.rstrip("/") not in self._bases:
             self._bases.append(fallback_base_url.rstrip("/"))
@@ -119,7 +151,8 @@ class KalshiReadOnlyClient:
         self._last_request = 0.0
         self._lock = asyncio.Lock()
         self._http = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
+            timeout=httpx.Timeout(timeout, connect=min(3.0, timeout)),
+            verify=_tls_context() if transport is None else True,
             headers={"Accept": "application/json", "User-Agent": "kalshi-btc-paper-bot/1.0 (paper trading; read-only)"},
             event_hooks={"request": [_guard_hook]},
             transport=transport,
@@ -134,7 +167,34 @@ class KalshiReadOnlyClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
+    @property
+    def clock_offset_seconds(self) -> float | None:
+        """Kalshi server time minus this computer's clock (median of recent HTTP Date headers)."""
+        if len(self._offset_samples) < 3:
+            return None
+        return statistics.median(self._offset_samples)
+
+    def _sample_offset(self, resp: httpx.Response, raw_start: datetime, raw_end: datetime) -> None:
+        header = resp.headers.get("Date")
+        if not header:
+            return
+        try:
+            server = parsedate_to_datetime(header)
+        except (TypeError, ValueError):
+            return
+        if server.tzinfo is None:
+            return
+        # The Date header is truncated to whole seconds: +0.5 s is its expected midpoint.
+        midpoint = raw_start + (raw_end - raw_start) / 2
+        self._offset_samples.append((server + timedelta(milliseconds=500) - midpoint).total_seconds())
+
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> tuple[dict[str, Any], httpx.Response]:
+        data, resp, _ = await self._get_timed(path, params)
+        return data, resp
+
+    async def _get_timed(self, path: str, params: dict[str, Any] | None = None
+                         ) -> tuple[dict[str, Any], httpx.Response, datetime]:
+        """GET with host failover. Also returns when the SUCCESSFUL attempt was sent."""
         clean = {k: v for k, v in (params or {}).items() if v is not None}
         errors: list[str] = []
         order = [self._active] + [i for i in range(len(self._bases)) if i != self._active]
@@ -149,26 +209,32 @@ class KalshiReadOnlyClient:
                 self._last_request = loop.time()
             try:
                 self.request_count += 1
+                attempt_at = self._now()
+                raw_start = datetime.now(UTC)
                 resp = await self._http.get(url, params=clean)
+                self._sample_offset(resp, raw_start, datetime.now(UTC))
             except ForbiddenEndpointError:
                 raise
             except (httpx.ConnectError, httpx.ProxyError, httpx.ConnectTimeout) as exc:
-                errors.append(f"{type(exc).__name__}: {exc} ({url})")
+                errors.append(f"{_explain(exc)} ({url})")
                 continue  # try the alternate production host
             except httpx.TimeoutException as exc:
                 raise KalshiConnectionError(f"Timeout: {type(exc).__name__} contacting {url}") from exc
             except httpx.HTTPError as exc:
-                raise KalshiConnectionError(f"{type(exc).__name__}: {exc} ({url})") from exc
+                raise KalshiConnectionError(f"{_explain(exc)} ({url})") from exc
             self._active = idx
             if resp.status_code == 429:
                 retry = float(resp.headers.get("Retry-After", "2") or 2)
                 raise KalshiRateLimited(429, "rate limited", url, retry)
             if resp.status_code == 404:
                 raise KalshiNotFound(404, _error_text(resp), url)
+            if resp.status_code == 403:
+                raise KalshiHTTPError(403, _error_text(resp) + " — access refused by Kalshi or a firewall/proxy in "
+                                      "between (Kalshi restricts some regions and networks)", url)
             if resp.status_code >= 400:
                 raise KalshiHTTPError(resp.status_code, _error_text(resp), url)
             try:
-                return resp.json(), resp
+                return resp.json(), resp, attempt_at
             except ValueError as exc:
                 raise KalshiHTTPError(resp.status_code, "response was not JSON", url) from exc
         raise KalshiConnectionError(" | ".join(errors))
@@ -220,8 +286,7 @@ class KalshiReadOnlyClient:
         return MarketInfo.from_api(data.get("market", data))
 
     async def get_orderbook(self, ticker: str) -> OrderBook:
-        requested_at = self._now()
-        data, resp = await self._get(f"/markets/{ticker}/orderbook")
+        data, resp, requested_at = await self._get_timed(f"/markets/{ticker}/orderbook")
         received_at = self._now()
         return OrderBook.from_api(ticker, data, requested_at, received_at, "live", resp.headers.get("Date"))
 

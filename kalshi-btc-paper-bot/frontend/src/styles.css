@@ -214,6 +214,36 @@ main { flex: 1; width: 100%; }
 .ticker { font-size: 0.85em; background: var(--surface-3); padding: 0.05rem 0.35rem; border-radius: 4px; }
 .ticker-link { text-decoration: none; white-space: nowrap; }
 
+/* ------------------------------------------------------------------ why-not-buying panel */
+.why { display: grid; grid-template-columns: 1fr auto; gap: 0.5rem 1rem; align-items: start; background: var(--surface);
+  border: 1px solid var(--border); border-left: 6px solid var(--muted); border-radius: var(--radius); padding: 0.85rem 1rem; box-shadow: var(--shadow); }
+.why-bad { border-left-color: var(--neg); }
+.why-wait { border-left-color: var(--warn-ink); }
+.why-good { border-left-color: var(--pos); }
+.why-title { display: flex; flex-direction: column; gap: 0.1rem; }
+.why-q { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 650; }
+.why-headline { font-size: 1.12rem; line-height: 1.3; }
+.why-detail { margin-top: 0.3rem; color: var(--ink-2); font-size: 0.9rem; overflow-wrap: anywhere; }
+.why-actions { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.why-checks { grid-column: 1 / -1; list-style: none; margin: 0.2rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+.why-check { display: grid; grid-template-columns: 1.4rem minmax(0, max-content) 1fr; gap: 0.5rem; align-items: baseline; font-size: 0.88rem;
+  padding: 0.25rem 0; border-top: 1px solid var(--border); }
+.why-icon { display: inline-flex; justify-content: center; font-weight: 800; border-radius: 999px; width: 1.25rem; height: 1.25rem; line-height: 1.25rem; font-size: 0.75rem; }
+.st-ok .why-icon { background: var(--good-bg); color: var(--pos); }
+.st-wait .why-icon { background: var(--warn-bg); color: var(--warn-ink); }
+.st-block .why-icon { background: var(--bad-bg); color: var(--neg); }
+.st-info .why-icon { background: var(--info-bg); color: var(--accent); }
+.why-check-title { font-weight: 600; }
+.why-check-detail { color: var(--ink-2); overflow-wrap: anywhere; }
+.why.compact { padding: 0.5rem 0.7rem; }
+.why.compact .why-headline { font-size: 0.98rem; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); border: 0; }
+.slot-note { font-size: 0.72rem; color: var(--neg); margin-top: 0.15rem; overflow-wrap: anywhere; }
+.gate-waiting_for_price, .gate-no_offers { background: var(--warn-bg) !important; color: var(--warn-ink) !important; }
+.gate-blocked, .gate-stale { background: var(--bad-bg) !important; color: var(--neg) !important; }
+.gate-revalidating, .gate-filled { background: var(--good-bg) !important; color: var(--pos) !important; }
+.simple-log summary { cursor: pointer; padding: 0.85rem 1rem; font-weight: 650; }
+
 /* ------------------------------------------------------------------ schedule */
 .schedule { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.4rem; margin: 0.75rem 0; }
 .slot { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.45rem 0.55rem; background: var(--surface-2); min-width: 0; }
@@ -425,6 +455,10 @@ legend { font-size: 0.86rem; color: var(--ink-2); padding: 0 0.3rem; }
   .brand-text strong { white-space: normal; }
   .brand-text .small { display: none; }
   .simple-grid.even { grid-template-columns: 1fr; }
+  .why { grid-template-columns: 1fr; }
+  .why-actions { justify-content: flex-start; }
+  .why-check { grid-template-columns: 1.4rem 1fr; }
+  .why-check-detail { grid-column: 2; }
   .header-actions .btn { padding: 0.35rem 0.55rem; font-size: 0.82rem; }
   .layout-simple, .layout-analytics { padding: 0.75rem; }
   .simple-hero { grid-template-columns: 1fr; padding: 1rem; gap: 1rem; }
