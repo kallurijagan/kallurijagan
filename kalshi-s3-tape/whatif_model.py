@@ -1,5 +1,10 @@
 """WHAT-IF MODEL, NOT MARKET DATA: luck in S3 (no re-buys) if the user's backtest averages hold.
 
+Assumptions (from the user's s1_price_grid summary for 1.6c / 86c, conservative fills):
+96 coin-windows per day, each independent of the others; per window 2.4% a caught comeback
+(+$168.80), 97.0% a dead side (-$3.20), 0.6% nothing ($0). No re-buys. Real markets have quiet
+and busy stretches, so this model understates risk. Money in cents (exact integers).
+
 Run: python whatif_model.py   (standard library only, Python 3.12+; about 15 s)
 """
 import random
