@@ -1,0 +1,40 @@
+{
+  "name": "S3",
+  "title": "1.6c / 86c with re-buys",
+  "frozen_on": "2026-11-18",
+  "source": "Rules exactly as written by the user in the S3 request. Prices were chosen by the user from backtests/results/s1_price_grid; nothing here was re-picked from results.",
+  "units": {
+    "price": "micro-dollars",
+    "quantity": "hundredths of a contract",
+    "money": "micro-dollars",
+    "time": "UTC microseconds"
+  },
+  "series": [
+    {"ticker": "KXBTC15M", "coin": "BTC"},
+    {"ticker": "KXETH15M", "coin": "ETH"}
+  ],
+  "open_minutes": [0, 15],
+  "entry_delay_us": 12000000,
+  "sides": ["yes", "no"],
+  "buy_price": 16000,
+  "buy_qty": 20000,
+  "sell_price": 860000,
+  "sell_delay_us": 1000000,
+  "rebuy": true,
+  "rebuy_price": 16000,
+  "rebuy_delay_us": 1000000,
+  "max_side_qty": 20000,
+  "post_only": true,
+  "crossing_order": "rejected and recorded, never re-posted",
+  "cancel_unfilled_at_close": true,
+  "settlement": "unsold contracts settle at Kalshi's official result ($1 or $0)",
+  "starting_cash": 1000000000,
+  "shared_account": true,
+  "same_instant_order": {"coin": ["BTC", "ETH"], "side": ["yes", "no"]},
+  "fees": {
+    "base_maker_rate": "0",
+    "sensitivity_maker_rate": "0.0175",
+    "formula": "rate * C * P * (1 - P), rounded up to the cent per execution"
+  },
+  "comparison_variant": "S3 without re-buys: identical except rebuy = false"
+}
